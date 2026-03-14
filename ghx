@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+Usage: ghx <repospec> [args...]
+       ghx <repospec> -- [entrypoint] [args...]
+
+Run a project from source without worrying about the runtime.
+Resolves repositories via ghq, detects the runtime automatically,
+and executes the appropriate run command.
+
+Options:
+  --help     Show this help message
+  --dryrun   Print the command that would be executed (copy-pasteable)
+
+Arguments:
+  <repospec>    Repository specifier passed to ghq (e.g., cli/cli, github.com/hashicorp/terraform)
+  --            Separator; everything after is the entrypoint and its arguments
+  [entrypoint]  Relative path to the entrypoint within the repo (e.g., cmd/server)
+  [args...]     Arguments forwarded to the executed command
+
+Runtime detection (in priority order):
+  go.mod         → go run
+  Cargo.toml     → cargo run
+  pyproject.toml → uv run
+  package.json   → npx
+
+If no runtime is detected, ghx attempts to directly execute the entrypoint
+or a file matching the repo basename.
+
+Examples:
+  ghx hashicorp/terraform version
+  ghx astral-sh/ruff check --help
+  ghx aws/aws-cli --version
+  ghx cli/cli -- cmd/gh version
+  ghx --dryrun hashicorp/terraform plan
+HELP
+}
+
+die() {
+  echo "ghx: $*" >&2
+  exit 1
+}
+
+# --- Argument parsing ---
+# ghx options (--help, --dryrun) must come before <repospec>.
+# Once repospec is found, remaining args go to FORWARD_ARGS (unless -- is hit).
+
+DRYRUN=false
+REPOSPEC=""
+FORWARD_ARGS=()
+ENTRYPOINT=""
+
+# Parse ghx options (before repospec)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --dryrun)
+      DRYRUN=true
+      shift
+      ;;
+    --)
+      # -- before repospec: error
+      die "missing repospec"
+      ;;
+    *)
+      REPOSPEC="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+[[ -n "$REPOSPEC" ]] || { usage; exit 1; }
+
+# Parse remaining args: everything goes to FORWARD_ARGS, except -- separates entrypoint
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)
+      shift
+      if [[ $# -gt 0 ]]; then
+        ENTRYPOINT="$1"
+        shift
+      fi
+      FORWARD_ARGS+=("$@")
+      break
+      ;;
+    *)
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# --- Repo resolution via ghq ---
+
+resolve_repo() {
+  local spec="$1"
+  local results
+  results="$(ghq list --full-path "$spec" 2>/dev/null)" || true
+
+  if [[ -z "$results" ]]; then
+    echo "ghx: repository not found locally, fetching..." >&2
+    ghq get "$spec" >&2 || die "failed to get repository: $spec"
+    results="$(ghq list --full-path "$spec" 2>/dev/null)" || true
+  fi
+
+  [[ -n "$results" ]] || die "repository not found: $spec"
+
+  local count
+  count="$(echo "$results" | wc -l | tr -d ' ')"
+  if [[ "$count" -gt 1 ]]; then
+    echo "ghx: ambiguous repospec, multiple matches:" >&2
+    echo "$results" >&2
+    exit 1
+  fi
+
+  echo "$results"
+}
+
+REPO_DIR="$(resolve_repo "$REPOSPEC")"
+NAME="$(basename "$REPO_DIR")"
+
+# --- Runtime detection ---
+
+detect_runtime() {
+  local dir="$1"
+  if [[ -f "$dir/go.mod" ]]; then
+    echo "go"
+  elif [[ -f "$dir/Cargo.toml" ]]; then
+    echo "rust"
+  elif [[ -f "$dir/pyproject.toml" ]]; then
+    echo "python"
+  elif [[ -f "$dir/package.json" ]]; then
+    echo "node"
+  else
+    echo "none"
+  fi
+}
+
+RUNTIME="$(detect_runtime "$REPO_DIR")"
+
+# --- Python command name detection ---
+
+# Try to find the actual command name from Python project metadata.
+# Checks (in order): pyproject.toml [project.scripts], setup.cfg console_scripts, setup.py scripts=
+detect_python_cmd() {
+  local dir="$1"
+  local fallback="$2"
+  local cmd
+
+  # 1. pyproject.toml [project.scripts] — first key before "="
+  if [[ -f "$dir/pyproject.toml" ]]; then
+    cmd="$(sed -n '/^\[project\.scripts\]/,/^\[/{/^\[/d; /^$/d; s/^ *\([a-zA-Z0-9_-]*\) *=.*/\1/p; q;}' "$dir/pyproject.toml" 2>/dev/null)"
+    [[ -n "$cmd" ]] && { echo "$cmd"; return; }
+  fi
+
+  # 2. setup.cfg [options.entry_points] console_scripts
+  if [[ -f "$dir/setup.cfg" ]]; then
+    cmd="$(sed -n '/console_scripts/,/^\[/{s/^ *\([a-zA-Z0-9_-]*\) *=.*/\1/p; q;}' "$dir/setup.cfg" 2>/dev/null)"
+    [[ -n "$cmd" ]] && { echo "$cmd"; return; }
+  fi
+
+  # 3. setup.py scripts=['bin/xxx', ...] — extract first script basename
+  if [[ -f "$dir/setup.py" ]]; then
+    cmd="$(sed -n "s/.*scripts *= *\['\([^']*\)'.*/\1/p" "$dir/setup.py" 2>/dev/null | head -1 | xargs basename 2>/dev/null)"
+    [[ -n "$cmd" ]] && { echo "$cmd"; return; }
+  fi
+
+  echo "$fallback"
+}
+
+# --- Build exec args ---
+
+build_exec_args() {
+  local runtime="$1"
+  local repo_dir="$2"
+  local name="$3"
+  local entrypoint="$4"
+  shift 4
+  local args=("$@")
+
+  case "$runtime" in
+    go)
+      local target
+      if [[ -n "$entrypoint" ]]; then
+        target="./$entrypoint"
+      elif [[ -d "$repo_dir/cmd/$name" ]]; then
+        target="./cmd/$name"
+      else
+        # Find if there's exactly one subdir under cmd/
+        local cmd_dirs=()
+        if [[ -d "$repo_dir/cmd" ]]; then
+          while IFS= read -r -d '' d; do
+            cmd_dirs+=("$d")
+          done < <(find "$repo_dir/cmd" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+        fi
+        if [[ ${#cmd_dirs[@]} -eq 1 ]]; then
+          target="./cmd/$(basename "${cmd_dirs[0]}")"
+        else
+          target="."
+        fi
+      fi
+      EXEC_ARGS=(go run "$target" "${args[@]+"${args[@]}"}")
+      ;;
+    rust)
+      local bin="${entrypoint:-$name}"
+      EXEC_ARGS=(cargo run --bin "$bin" -- "${args[@]+"${args[@]}"}")
+      ;;
+    python)
+      local cmd
+      if [[ -n "$entrypoint" ]]; then
+        cmd="$entrypoint"
+      else
+        cmd="$(detect_python_cmd "$repo_dir" "$name")"
+      fi
+      EXEC_ARGS=(uv run "$cmd" "${args[@]+"${args[@]}"}")
+      ;;
+    node)
+      local cmd="${entrypoint:-$name}"
+      EXEC_ARGS=(npx "$cmd" "${args[@]+"${args[@]}"}")
+      ;;
+    none)
+      if [[ -n "$entrypoint" ]]; then
+        EXEC_ARGS=("./$entrypoint" "${args[@]+"${args[@]}"}")
+      elif [[ -x "$repo_dir/$name" ]]; then
+        EXEC_ARGS=("./$name" "${args[@]+"${args[@]}"}")
+      else
+        die "no runtime detected and no executable found for: $name"
+      fi
+      ;;
+  esac
+}
+
+EXEC_ARGS=()
+build_exec_args "$RUNTIME" "$REPO_DIR" "$NAME" "$ENTRYPOINT" "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
+
+# --- Dryrun or exec ---
+
+shell_quote() {
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^[a-zA-Z0-9_./:=-]+$ ]]; then
+      printf '%s ' "$arg"
+    else
+      printf '%q ' "$arg"
+    fi
+  done
+}
+
+if [[ "$DRYRUN" == true ]]; then
+  printf 'cd %s && %s\n' "$REPO_DIR" "$(shell_quote "${EXEC_ARGS[@]}")"
+  exit 0
+fi
+
+cd "$REPO_DIR"
+exec "${EXEC_ARGS[@]}"
